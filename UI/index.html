@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moral Machine AI - ONNX Inference</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f9; color: #333; max-width: 1200px; margin: 0 auto; padding: 20px; }
+        h1, h2, h3 { color: #2c3e50; text-align: center; }
+        .container { display: flex; flex-direction: column; gap: 20px; }
+        .controls { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .scenario-container { display: flex; gap: 20px; justify-content: space-between; flex-wrap: wrap; }
+        .track { flex: 1; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); min-width: 300px; }
+        .track.a { border-top: 5px solid #3498db; }
+        .track.b { border-top: 5px solid #e74c3c; }
+        .track h3 { margin-top: 0; }
+        .input-group { margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+        .input-group label { flex: 1; font-size: 0.9em; }
+        .input-group input { width: 60px; padding: 5px; border: 1px solid #ccc; border-radius: 4px; }
+        .result-panel { background: #2c3e50; color: white; padding: 20px; border-radius: 8px; text-align: center; margin-top: 20px; }
+        .prediction { font-size: 1.5em; font-weight: bold; margin-bottom: 15px; }
+        .bar-container { background: rgba(255,255,255,0.2); height: 30px; border-radius: 15px; overflow: hidden; position: relative; margin: 20px 0; }
+        .bar-fill { height: 100%; transition: width 0.5s ease; }
+        .deaths-slider input[type=range] { width: 100%; }
+        .death-count { font-size: 2em; font-weight: bold; color: #e74c3c; }
+        select { padding: 8px; width: 100%; max-width: 300px; border-radius: 4px; border: 1px solid #ccc; }
+        button { background: #27ae60; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 1.1em; margin-top: 10px; }
+        button:hover { background: #219150; }
+        .loading { color: #888; font-style: italic; }
+        
+        /* Helper classes for outcome visualization */
+        .outcome-safe { color: #27ae60; }
+        .outcome-dead { color: #c0392b; text-decoration: line-through; }
+    </style>
+</head>
+<body>
+
+    <h1>Moral Machine AI</h1>
+    <p style="text-align: center;">Client-side ONNX Inference</p>
+
+    <div class="result-panel">
+        <div id="loadingMsg">Loading AI Model and Data...</div>
+        <div id="results" style="display:none;">
+            <div class="prediction" id="predictionText">AI is deciding...</div>
+            
+            <h3>Projected Fatalities</h3>
+            <div class="death-count">
+                <span id="deathCount">0</span> Deaths
+            </div>
+            <input type="range" id="deathSlider" min="0" max="20" value="0" disabled style="width: 50%; accent-color: #e74c3c;">
+            <p><small>(Based on the AI's choice to sacrifice a specific track)</small></p>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="controls" style="text-align: center;">
+            <label for="countrySelect"><strong>Context Country:</strong></label><br>
+            <select id="countrySelect" onchange="runInference()">
+                <option value="0">Loading countries...</option>
+            </select>
+        </div>
+
+        <div class="scenario-container">
+            <!-- Option A -->
+            <div class="track a">
+                <h3>Option A (Left)</h3>
+                <div id="inputsA"></div>
+            </div>
+
+            <!-- Option B -->
+            <div class="track b">
+                <h3>Option B (Right)</h3>
+                <div id="inputsB"></div>
+            </div>
+        </div>
+        
+        <div style="text-align: center;">
+            <button onclick="runInference()">Run Inference</button>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const EXT_CHAR_COLS = ['Man', 'Woman', 'Pregnant', 'Stroller', 'OldMan', 'OldWoman', 'Boy', 'Girl', 
+                             'Homeless', 'LargeWoman', 'LargeMan', 'Criminal', 'MaleExecutive', 'FemaleExecutive', 
+                             'FemaleAthlete', 'MaleAthlete', 'FemaleDoctor', 'MaleDoctor', 'Dog', 'Cat'];
+        const CTX_COLS = ['Intervention', 'CrossingSignal'];
+        const ALL_FEATS = [...EXT_CHAR_COLS, ...CTX_COLS];
+
+        let session = null;
+        let countryMapping = {};
+
+        // Initialize Input Fields
+        function createInputs(prefix, containerId) {
+            const container = document.getElementById(containerId);
+            ALL_FEATS.forEach((feat, idx) => {
+                const div = document.createElement('div');
+                div.className = 'input-group';
+                
+                const label = document.createElement('label');
+                label.innerText = feat;
+                label.htmlFor = prefix + idx;
+                
+                const input = document.createElement('input');
+                input.type = 'number';
+                input.id = prefix + idx;
+                input.min = '0';
+                input.value = '0'; // Default 0
+                // Default 'Man' to 1 for A to make it interesting
+                if(feat === 'Man' && prefix === 'A_') input.value = 1;
+
+                input.onchange = runInference; // Auto-update
+                
+                div.appendChild(label);
+                div.appendChild(input);
+                container.appendChild(div);
+            });
+        }
+
+        async function init() {
+            createInputs('A_', 'inputsA');
+            createInputs('B_', 'inputsB');
+
+            try {
+                // 1. Load Country Mapping
+                const resp = await fetch('country_mapping.json');
+                countryMapping = await resp.json();
+                
+                const select = document.getElementById('countrySelect');
+                select.innerHTML = '';
+                const sortedCountries = Object.keys(countryMapping).sort();
+                sortedCountries.forEach(c => {
+                    const opt = document.createElement('option');
+                    opt.value = countryMapping[c];
+                    opt.innerText = c;
+                    if(c === 'USA') opt.selected = true; // Default
+                    select.appendChild(opt);
+                });
+
+                // 2. Load ONNX Model
+                // Note: ort.InferenceSession.create must be called with the path
+                // For GitHub Pages or local servers, this relative path works.
+                session = await ort.InferenceSession.create('./model.onnx');
+                
+                document.getElementById('loadingMsg').style.display = 'none';
+                document.getElementById('results').style.display = 'block';
+
+                // Initial Run
+                runInference();
+
+            } catch (e) {
+                console.error(e);
+                document.getElementById('loadingMsg').innerText = "Error loading resources: " + e.message + ". ensure you are running on a local web server (http://) not file://";
+            }
+        }
+
+        function getFeatures(prefix) {
+            const feats = [];
+            // Order must match ALL_FEATS which matches training order
+            // 20 chars + 2 context
+            for (let i = 0; i < ALL_FEATS.length; i++) {
+                const val = parseFloat(document.getElementById(prefix + i).value) || 0;
+                feats.push(val);
+            }
+            return feats;
+        }
+
+        function countCharacters(prefix) {
+            let count = 0;
+            // Only count characters (indices 0 to 19), exclude context
+            for (let i = 0; i < EXT_CHAR_COLS.length; i++) {
+                 const val = parseFloat(document.getElementById(prefix + i).value) || 0;
+                 count += val;
+            }
+            return count;
+        }
+
+        async function runInference() {
+            if (!session) return;
+
+            const featsA = getFeatures('A_');
+            const featsB = getFeatures('B_');
+            const countryVal = parseInt(document.getElementById('countrySelect').value);
+
+            // Create Tensors
+            // Shape: [1, 22]
+            const tensorA = new ort.Tensor('float32', Float32Array.from(featsA), [1, 22]);
+            const tensorB = new ort.Tensor('float32', Float32Array.from(featsB), [1, 22]);
+            // Shape: [1]
+            const tensorC = new ort.Tensor('int64', BigInt64Array.from([BigInt(countryVal)]), [1]);
+
+            // Run
+            const feeds = { input_a: tensorA, input_b: tensorB, country_idx: tensorC };
+            const results = await session.run(feeds);
+            const logits = results.logits.data[0]; // Float32
+
+            // Sigmoid
+            const probB = 1 / (1 + Math.exp(-logits)); // Probability of choosing B
+
+            updateUI(probB);
+        }
+
+        function updateUI(probB) {
+            const chooseB = probB > 0.5;
+            
+            const txt = document.getElementById('predictionText');
+            const deathsSpan = document.getElementById('deathCount');
+            const slider = document.getElementById('deathSlider');
+            
+            let deaths = 0;
+            
+            if (chooseB) {
+                // Chosen B (Right) -> Saved B, Sacrificed A (Left)
+                // In Moral Machine standard: Label=1 means Saved Option B.
+                txt.innerText = "AI Choice: SAVE Option B (Right)";
+                txt.style.color = "#e74c3c"; // Right color
+                
+                // Deaths = Characters in A
+                deaths = countCharacters('A_');
+            } else {
+                // Chosen A (Left) -> Saved A, Sacrificed B (Right)
+                txt.innerText = "AI Choice: SAVE Option A (Left)";
+                txt.style.color = "#3498db"; // Left color
+                
+                // Deaths = Characters in B
+                deaths = countCharacters('B_');
+            }
+            
+            deathsSpan.innerText = deaths;
+            slider.value = deaths;
+        }
+
+        // Start
+        init();
+
+    </script>
+</body>
+</html>
